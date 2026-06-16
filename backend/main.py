@@ -4,9 +4,14 @@
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode, quote
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -14,7 +19,10 @@ from fastapi.responses import HTMLResponse
 # 将 backend 目录加入 Python 路径
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import HOST, PORT, ANSWER_TIME_LIMIT
+from config import (
+    HOST, PORT, ANSWER_TIME_LIMIT,
+    IFLYTEK_APP_ID, IFLYTEK_API_KEY, IFLYTEK_API_SECRET,
+)
 from models import GameStatus
 from poem_bank import PoemBank
 from game_engine import GameEngine
@@ -54,6 +62,58 @@ async def get_poem(poem_id: int):
     if not poem:
         return {"error": "诗词不存在"}
     return poem
+
+
+@app.get("/api/iflytek/ws_url")
+async def get_iflytek_ws_url():
+    """
+    生成讯飞语音听写 WebSocket 鉴权 URL
+    密钥在后端签名，不暴露给前端
+    """
+    try:
+        host = "ws-api.xfyun.cn"
+        path = "/v2/iat"
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        # 构建签名原文
+        signature_origin = (
+            f"host: {host}\n"
+            f"date: {date_str}\n"
+            f"GET {path} HTTP/1.1"
+        )
+
+        # HMAC-SHA256 签名
+        signature_sha = hmac.new(
+            IFLYTEK_API_SECRET.encode("utf-8"),
+            signature_origin.encode("utf-8"),
+            digestmod=hashlib.sha256,
+        ).digest()
+        signature = base64.b64encode(signature_sha).decode("utf-8")
+
+        # 构建 authorization
+        authorization_origin = (
+            f'api_key="{IFLYTEK_API_KEY}", '
+            f'algorithm="hmac-sha256", '
+            f'headers="host date request-line", '
+            f'signature="{signature}"'
+        )
+        authorization = base64.b64encode(
+            authorization_origin.encode("utf-8")
+        ).decode("utf-8")
+
+        # 拼接 WebSocket URL
+        params = {
+            "authorization": authorization,
+            "date": date_str,
+            "host": host,
+        }
+        url = f"wss://{host}{path}?{urlencode(params)}"
+
+        return {"url": url, "app_id": IFLYTEK_APP_ID}
+    except Exception as e:
+        print(f"[讯飞] 鉴权URL生成失败: {type(e).__name__}: {e}")
+        return {"error": str(e)}
 
 
 # --- WebSocket 游戏通信（本地双人，单连接） ---

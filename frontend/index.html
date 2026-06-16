@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>诗词PK</title>
     <link href="https://fonts.googleapis.com/css2?family=LXGW+WenKai+TC&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
     <style>
         /* ============ 基础重置与变量 ============ */
         * {
@@ -1231,10 +1232,19 @@
         countdownTimer: null,
         countdownValue: 60,
         isRecording: false,
-        recognition: null,
-        speechSupported: true,
         recognitionText: '',
-        timerStarted: false
+        timerStarted: false,
+        // 讯飞语音识别相关
+        iflytekWs: null,
+        iflytekMediaStream: null,
+        iflytekAudioContext: null,
+        iflytekScriptProcessor: null,
+        iflytekEncoder: null,
+        iflytekFinalText: '',
+        iflytekIsFirstFrame: true,
+        speechSupported: true,
+        // 调试模式：没有麦克风时设为 true，用文字输入模拟语音识别
+        debugNoMic: false
     };
 
     /* ============================================================
@@ -1488,8 +1498,8 @@
         $('btn-submit-text').disabled = true;
 
         // 停止录音（如果正在进行）
-        if (state.recognition && state.isRecording) {
-            try { state.recognition.abort(); } catch (e) {}
+        if (state.isRecording) {
+            _cleanupIflytek();
         }
 
         // 更新分数
@@ -1816,11 +1826,8 @@
 
     function onCountdownEnd() {
         // 停止录音
-        if (state.isRecording && state.recognition) {
-            try { state.recognition.stop(); } catch (e) {}
-            state.isRecording = false;
-            $('btn-speak').classList.remove('recording');
-            $('speak-text').innerHTML = '按住<br>说话';
+        if (state.isRecording) {
+            stopRecording();
         }
 
         // 禁用按钮
@@ -1861,80 +1868,472 @@
     }
 
     /* ============================================================
-     *  语音识别（Web Speech API）
+     *  语音识别（科大讯飞 WebSocket 流式方案）
      * ============================================================ */
     function initSpeechRecognition() {
-        var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRecognition) {
+        // 检查浏览器是否支持所需 API
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             state.speechSupported = false;
-            console.warn('[语音] 当前浏览器不支持语音识别');
+            console.warn('[语音] 当前浏览器不支持 getUserMedia');
             return;
         }
+        if (typeof lamejs === 'undefined') {
+            state.speechSupported = false;
+            console.warn('[语音] lamejs 库未加载，语音识别不可用');
+            return;
+        }
+        if (!window.AudioContext && !window.webkitAudioContext) {
+            state.speechSupported = false;
+            console.warn('[语音] 当前浏览器不支持 Web Audio API');
+            return;
+        }
+        console.log('[语音] 讯飞语音识别已就绪');
+    }
 
-        state.recognition = new SpeechRecognition();
-        state.recognition.lang = 'zh-CN';
-        state.recognition.continuous = false;
-        state.recognition.interimResults = false;
-
-        // 识别结果
-        state.recognition.onresult = function(event) {
-            var text = '';
-            for (var i = 0; i < event.results.length; i++) {
-                if (event.results[i].isFinal) {
-                    text += event.results[i][0].transcript;
-                }
+    /** 获取讯飞鉴权 WebSocket URL */
+    async function fetchIflytekWsUrl() {
+        try {
+            var resp = await fetch('/api/iflytek/ws_url');
+            var data = await resp.json();
+            if (data.error) {
+                console.error('[讯飞] 获取鉴权URL失败:', data.error);
+                return null;
             }
-            state.recognitionText = text;
+            return data;
+        } catch (e) {
+            console.error('[讯飞] 请求鉴权URL异常:', e);
+            return null;
+        }
+    }
 
-            // 更新显示
-            var resultEl = $('recognize-result');
-            resultEl.textContent = text || '(未识别到内容)';
-            resultEl.classList.remove('empty');
-        };
+    /** 将 Int16 PCM 数组编码为 base64 */
+    function pcmToBase64(pcmData) {
+        var bytes = new Uint8Array(pcmData.length * 2);
+        for (var i = 0; i < pcmData.length; i++) {
+            bytes[i * 2] = pcmData[i] & 0xff;
+            bytes[i * 2 + 1] = (pcmData[i] >> 8) & 0xff;
+        }
+        var binary = '';
+        for (var j = 0; j < bytes.length; j++) {
+            binary += String.fromCharCode(bytes[j]);
+        }
+        return btoa(binary);
+    }
 
-        // 识别错误
-        state.recognition.onerror = function(event) {
-            console.error('[语音] 识别错误:', event.error);
-            state.isRecording = false;
-            $('btn-speak').classList.remove('recording');
-            $('speak-text').innerHTML = '按住<br>说话';
+    /** 启动讯飞录音 + WebSocket 流式识别 */
+    function startRecording() {
+        if ($('btn-speak').disabled) return;
+        if (state.isRecording) return;
 
-            if (event.error === 'no-speech') {
-                // 没有检测到语音，不发送
-            } else if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-                showToast('请允许麦克风权限后重试');
-            } else if (event.error === 'aborted') {
-                // 被中止，忽略
+        // 停止当前 TTS 播放
+        if (window.speechSynthesis) speechSynthesis.cancel();
+
+        state.recognitionText = '';
+        state.iflytekFinalText = '';
+        state.iflytekIsFirstFrame = true;
+
+        var resultEl = $('recognize-result');
+        resultEl.textContent = '正在连接讯飞...';
+        resultEl.classList.remove('empty');
+
+        // 获取鉴权 URL 并启动录音
+        fetchIflytekWsUrl().then(function(data) {
+            if (!data || !data.url) {
+                showToast('语音服务不可用，请检查后端配置');
+                return;
+            }
+
+            if (state.debugNoMic) {
+                // 调试模式：验证连接 + 弹出文字输入模拟
+                _debugTestConnection(data.url);
             } else {
-                showToast('语音识别出错：' + event.error);
+                _startIflytekRecording(data.url);
+            }
+        });
+    }
+
+    /** 调试模式：验证讯飞连接 + 文字输入模拟语音识别 */
+    function _debugTestConnection(wsUrl) {
+        var ws = new WebSocket(wsUrl);
+        var connected = false;
+
+        var timeout = setTimeout(function() {
+            if (!connected) {
+                showToast('讯飞连接超时');
+                try { ws.close(); } catch(e) {}
+            }
+        }, 8000);
+
+        ws.onopen = function() {
+            connected = true;
+            clearTimeout(timeout);
+            console.log('[调试] 讯飞 WebSocket 连接成功');
+
+            // 发送一个空帧 + 结束帧来验证完整流程
+            var firstFrame = {
+                data: { status: 0, format: 'audio/L16;rate=16000', encoding: 'lame', audio: '' }
+            };
+            ws.send(JSON.stringify(firstFrame));
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                var resp = JSON.parse(event.data);
+                if (resp.code === 0) {
+                    console.log('[调试] 讯飞响应正常, status=' + (resp.data ? resp.data.status : '?'));
+                    if (resp.data && resp.data.status === 2) {
+                        ws.close();
+                        _showDebugInput();
+                    }
+                } else {
+                    console.warn('[调试] 讯飞返回错误 code=' + resp.code);
+                    ws.close();
+                    _showDebugInput();
+                }
+            } catch(e) {
+                console.error('[调试] 解析响应失败:', e);
+                ws.close();
+                _showDebugInput();
             }
         };
 
-        // 识别结束
-        state.recognition.onend = function() {
-            var wasRecording = state.isRecording;
-            state.isRecording = false;
-            $('btn-speak').classList.remove('recording');
-            $('speak-text').innerHTML = '按住<br>说话';
+        ws.onerror = function(e) {
+            console.error('[调试] WebSocket 错误:', e);
+            showToast('讯飞连接失败，请检查配置');
+        };
 
-            // 如果之前确实在录音，发送结果
-            if (wasRecording && state.recognitionText) {
-                sendMessage({
-                    type: 'stop_recording',
-                    text: state.recognitionText
-                });
-            } else if (wasRecording && !state.recognitionText) {
-                // 录音结束但没有识别到文字
-                var resultEl = $('recognize-result');
-                resultEl.textContent = '(未识别到语音内容)';
-                resultEl.classList.remove('empty');
-                // 发送空文本让服务端知道用户已作答
-                sendMessage({
-                    type: 'stop_recording',
-                    text: ''
-                });
+        ws.onclose = function() {
+            console.log('[调试] WebSocket 已关闭');
+        };
+    }
+
+    /** 调试模式：显示文字输入弹层模拟语音识别结果 */
+    function _showDebugInput() {
+        // 更新 UI 为录音状态
+        state.isRecording = true;
+        $('btn-speak').classList.add('recording');
+        $('speak-text').innerHTML = '调试<br>模式';
+
+        // 启动倒计时（仅首次）
+        if (!state.timerStarted) {
+            startCountdown(60);
+        }
+
+        var resultEl = $('recognize-result');
+        resultEl.innerHTML = '<span style="color:#e67e22;">[调试] 讯飞连接正常 ✓</span><br>'
+            + '<input id="debug-mic-input" type="text" placeholder="输入模拟语音识别结果..." '
+            + 'style="width:100%;margin-top:8px;padding:8px 12px;border:2px solid #e67e22;border-radius:8px;'
+            + 'font-size:15px;outline:none;font-family:inherit;" '
+            + 'onkeydown="if(event.key===\'Enter\'){event.preventDefault();_debugSubmitInput();}">';
+        resultEl.classList.remove('empty');
+
+        // 自动聚焦
+        setTimeout(function() {
+            var inp = document.getElementById('debug-mic-input');
+            if (inp) inp.focus();
+        }, 100);
+    }
+
+    /** 调试模式：提交模拟输入 */
+    function _debugSubmitInput() {
+        var inp = document.getElementById('debug-mic-input');
+        var text = inp ? inp.value.trim() : '';
+        state.recognitionText = text;
+        state.iflytekFinalText = text;
+
+        var resultEl = $('recognize-result');
+        resultEl.textContent = text || '(未输入内容)';
+        resultEl.classList.remove('empty');
+
+        state.isRecording = false;
+        $('btn-speak').classList.remove('recording');
+        $('speak-text').innerHTML = '按住<br>说话';
+        stopCountdown();
+
+        // 发送答案给游戏后端
+        sendMessage({ type: 'stop_recording', text: text });
+    }
+
+    function _startIflytekRecording(wsUrl) {
+        // 初始化 lamejs MP3 编码器（16kHz 单声道 32kbps）
+        state.iflytekEncoder = new lamejs.Mp3Encoder(1, 16000, 32);
+
+        // 建立 WebSocket 连接
+        var ws = new WebSocket(wsUrl);
+        state.iflytekWs = ws;
+        var wsConnected = false;
+
+        var connectTimeout = setTimeout(function() {
+            if (!wsConnected) {
+                console.error('[讯飞] WebSocket 连接超时');
+                showToast('语音识别连接超时，请检查网络');
+                _cleanupIflytek();
+            }
+        }, 8000);
+
+        ws.onopen = function() {
+            clearTimeout(connectTimeout);
+            wsConnected = true;
+            console.log('[讯飞] WebSocket 已连接');
+            _startAudioCapture();
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                var resp = JSON.parse(event.data);
+                if (resp.code !== 0) {
+                    console.error('[讯飞] 识别错误 code=' + resp.code + ', message=' + resp.message);
+                    showToast('语音识别出错: ' + resp.code);
+                    _cleanupIflytek();
+                    return;
+                }
+
+                // 解析识别结果
+                if (resp.data && resp.data.result && resp.data.result.ws) {
+                    var text = '';
+                    resp.data.result.ws.forEach(function(ws_item) {
+                        ws_item.cw.forEach(function(cw_item) {
+                            text += cw_item.w;
+                        });
+                    });
+
+                    // sn 去重更新（讯飞流式识别可能用 pgs=rpg 模式修正之前的句子）
+                    if (text) {
+                        state.recognitionText = text;
+                        var resultEl = $('recognize-result');
+                        resultEl.textContent = text;
+                        resultEl.classList.remove('empty');
+                    }
+                }
+
+                // status=2 表示识别结束（收到最终结果）
+                if (resp.data && resp.data.status === 2) {
+                    state.iflytekFinalText = state.recognitionText;
+                    console.log('[讯飞] 识别完成:', state.iflytekFinalText);
+                    if (ws.readyState === WebSocket.OPEN) ws.close();
+                    _onIflytekComplete();
+                }
+            } catch (e) {
+                console.error('[讯飞] 解析响应失败:', e, event.data);
             }
         };
+
+        ws.onerror = function(e) {
+            console.error('[讯飞] WebSocket 错误:', e);
+            showToast('语音识别连接失败');
+            _cleanupIflytek();
+        };
+
+        ws.onclose = function(e) {
+            console.log('[讯飞] WebSocket 关闭, code=' + e.code);
+            if (state.isRecording && state.iflytekFinalText === '') {
+                // 意外关闭，用当前文本
+                state.iflytekFinalText = state.recognitionText;
+                _onIflytekComplete();
+            }
+        };
+    }
+
+    /** 启动麦克风采音 + MP3 编码 + 流式发送 */
+    function _startAudioCapture() {
+        navigator.mediaDevices.getUserMedia({ audio: true })
+            .then(function(stream) {
+                state.iflytekMediaStream = stream;
+
+                var AudioCtx = window.AudioContext || window.webkitAudioContext;
+                state.iflytekAudioContext = new AudioCtx({ sampleRate: 16000 });
+                var source = state.iflytekAudioContext.createMediaStreamSource(stream);
+                var processor = state.iflytekAudioContext.createScriptProcessor(4096, 1, 1);
+                state.iflytekScriptProcessor = processor;
+
+                processor.onaudioprocess = function(e) {
+                    if (!state.isRecording) return;
+                    var ws = state.iflytekWs;
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+                    // Float32 → Int16 PCM
+                    var inputData = e.inputBuffer.getChannelData(0);
+                    var pcm = new Int16Array(inputData.length);
+                    for (var i = 0; i < inputData.length; i++) {
+                        var s = Math.max(-1, Math.min(1, inputData[i]));
+                        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+
+                    // lamejs 编码为 MP3 帧
+                    var mp3Buf = state.iflytekEncoder.encodeBuffer(pcm);
+                    if (mp3Buf.length === 0) return;
+
+                    // MP3 帧 → base64
+                    var binary = '';
+                    for (var j = 0; j < mp3Buf.length; j++) {
+                        binary += String.fromCharCode(mp3Buf[j]);
+                    }
+                    var audioBase64 = btoa(binary);
+
+                    // 构建讯飞协议帧
+                    var frame;
+                    if (state.iflytekIsFirstFrame) {
+                        frame = {
+                            data: {
+                                status: 0,
+                                format: 'audio/L16;rate=16000',
+                                encoding: 'lame',
+                                audio: audioBase64
+                            }
+                        };
+                        state.iflytekIsFirstFrame = false;
+                    } else {
+                        frame = {
+                            data: {
+                                status: 1,
+                                format: 'audio/L16;rate=16000',
+                                encoding: 'lame',
+                                audio: audioBase64
+                            }
+                        };
+                    }
+
+                    try {
+                        ws.send(JSON.stringify(frame));
+                    } catch (sendErr) {
+                        console.warn('[讯飞] 发送帧失败:', sendErr.message);
+                    }
+                };
+
+                source.connect(processor);
+                processor.connect(state.iflytekAudioContext.destination);
+
+                // 更新 UI 状态
+                state.isRecording = true;
+                $('btn-speak').classList.add('recording');
+                $('speak-text').innerHTML = '松开<br>结束';
+                $('recognize-result').textContent = '正在聆听...';
+                $('recognize-result').classList.remove('empty');
+
+                // 启动倒计时（仅首次）
+                if (!state.timerStarted) {
+                    startCountdown(60);
+                }
+
+                console.log('[讯飞] 麦克风采音已启动 (16kHz mono → MP3)');
+            })
+            .catch(function(err) {
+                console.error('[讯飞] 麦克风权限获取失败:', err);
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    showToast('请允许麦克风权限后重试');
+                } else {
+                    showToast('无法访问麦克风: ' + err.message);
+                }
+                _cleanupIflytek();
+            });
+    }
+
+    /** 停止讯飞录音 */
+    function stopRecording() {
+        if (!state.isRecording) return;
+        state.isRecording = false;
+
+        // 停止倒计时
+        stopCountdown();
+
+        // 刷新编码器并发送最终帧
+        if (state.iflytekEncoder && state.iflytekWs && state.iflytekWs.readyState === WebSocket.OPEN) {
+            var mp3End = state.iflytekEncoder.flush();
+            var endAudio = '';
+            if (mp3End.length > 0) {
+                var binary = '';
+                for (var j = 0; j < mp3End.length; j++) {
+                    binary += String.fromCharCode(mp3End[j]);
+                }
+                endAudio = btoa(binary);
+            }
+
+            try {
+                state.iflytekWs.send(JSON.stringify({
+                    data: {
+                        status: 2,
+                        format: 'audio/L16;rate=16000',
+                        encoding: 'lame',
+                        audio: endAudio
+                    }
+                }));
+                console.log('[讯飞] 已发送最终帧 (status=2)');
+            } catch (e) {
+                console.warn('[讯飞] 发送最终帧失败:', e.message);
+            }
+        }
+
+        // 停止麦克风采集
+        if (state.iflytekScriptProcessor) {
+            try { state.iflytekScriptProcessor.disconnect(); } catch (e) {}
+            state.iflytekScriptProcessor = null;
+        }
+        if (state.iflytekAudioContext) {
+            try { state.iflytekAudioContext.close(); } catch (e) {}
+            state.iflytekAudioContext = null;
+        }
+        if (state.iflytekMediaStream) {
+            state.iflytekMediaStream.getTracks().forEach(function(t) { t.stop(); });
+            state.iflytekMediaStream = null;
+        }
+
+        // 更新 UI
+        $('btn-speak').classList.remove('recording');
+        $('speak-text').innerHTML = '按住<br>说话';
+
+        // 设置超时：如果 5 秒内没收到最终结果，用当前文本提交
+        setTimeout(function() {
+            if (state.iflytekFinalText === '' && !state.iflytekWs) {
+                state.iflytekFinalText = state.recognitionText;
+                _onIflytekComplete();
+            }
+        }, 5000);
+    }
+
+    /** 讯飞识别完成回调 —— 发送答案给游戏服务端 */
+    function _onIflytekComplete() {
+        _cleanupIflytek();
+        var text = state.iflytekFinalText || '';
+
+        var resultEl = $('recognize-result');
+        if (text) {
+            resultEl.textContent = text;
+        } else {
+            resultEl.textContent = '(未识别到语音内容)';
+        }
+        resultEl.classList.remove('empty');
+
+        // 发送答案给游戏后端
+        sendMessage({
+            type: 'stop_recording',
+            text: text
+        });
+    }
+
+    /** 清理讯飞资源 */
+    function _cleanupIflytek() {
+        if (state.iflytekWs) {
+            try {
+                if (state.iflytekWs.readyState === WebSocket.OPEN ||
+                    state.iflytekWs.readyState === WebSocket.CONNECTING) {
+                    state.iflytekWs.close();
+                }
+            } catch (e) {}
+            state.iflytekWs = null;
+        }
+        if (state.iflytekScriptProcessor) {
+            try { state.iflytekScriptProcessor.disconnect(); } catch (e) {}
+            state.iflytekScriptProcessor = null;
+        }
+        if (state.iflytekAudioContext) {
+            try { state.iflytekAudioContext.close(); } catch (e) {}
+            state.iflytekAudioContext = null;
+        }
+        if (state.iflytekMediaStream) {
+            state.iflytekMediaStream.getTracks().forEach(function(t) { t.stop(); });
+            state.iflytekMediaStream = null;
+        }
+        state.iflytekEncoder = null;
     }
 
     /* ============================================================
@@ -1976,62 +2375,6 @@
                 stopRecording();
             }
         });
-    }
-
-    function startRecording() {
-        // 按钮被禁用时不响应
-        if ($('btn-speak').disabled) return;
-        if (state.isRecording) return;
-
-        // 如果浏览器不支持语音识别
-        if (!state.speechSupported || !state.recognition) {
-            showToast('当前浏览器不支持语音识别，请使用 Chrome 浏览器');
-            return;
-        }
-
-        // 停止当前 TTS 播放
-        if (window.speechSynthesis) {
-            speechSynthesis.cancel();
-        }
-
-        // 清空之前的识别结果
-        state.recognitionText = '';
-        var resultEl = $('recognize-result');
-        resultEl.textContent = '正在聆听...';
-        resultEl.classList.remove('empty');
-
-        // 启动语音识别
-        try {
-            state.recognition.start();
-        } catch (e) {
-            // 可能已经在运行
-            console.warn('[语音] start() 异常:', e.message);
-        }
-
-        state.isRecording = true;
-        $('btn-speak').classList.add('recording');
-        $('speak-text').innerHTML = '松开<br>结束';
-
-        // 启动倒计时（仅在首次启动时）
-        if (!state.timerStarted) {
-            startCountdown(60);
-        }
-    }
-
-    function stopRecording() {
-        if (!state.isRecording) return;
-
-        // 停止语音识别（onend 回调会处理发送逻辑）
-        if (state.recognition) {
-            try {
-                state.recognition.stop();
-            } catch (e) {
-                console.warn('[语音] stop() 异常:', e.message);
-            }
-        }
-
-        // 停止倒计时
-        stopCountdown();
     }
 
     /* ============================================================
@@ -2135,6 +2478,9 @@
         state.recognitionText = '';
         state.timerStarted = false;
         stopCountdown();
+
+        // 清理讯飞资源
+        _cleanupIflytek();
 
         // 停止 TTS
         if (window.speechSynthesis) speechSynthesis.cancel();

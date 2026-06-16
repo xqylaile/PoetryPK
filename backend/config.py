@@ -22,6 +22,12 @@ ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY", "c4ed6582364f4a22a1488f950aac255f.pr8
 ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
 ZHIPU_MODEL = "glm-4-flash"  # 完全免费的模型
 
+# --- 讯飞语音识别配置 ---
+# 注册地址: https://www.xfyun.cn/  控制台创建应用后获取
+IFLYTEK_APP_ID = os.getenv("IFLYTEK_APP_ID", "eed798f3")
+IFLYTEK_API_KEY = os.getenv("IFLYTEK_API_KEY", "659166a65ab1ec26008fdf816dc75e60")
+IFLYTEK_API_SECRET = os.getenv("IFLYTEK_API_SECRET", "YzY1ZDA4ZWIwNDY1Y2JlYTJhMDhiNjZh")
+
 # --- 答案判定配置 ---
 SIMILARITY_THRESHOLD = 0.8  # 模糊匹配相似度阈值
 
