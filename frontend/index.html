@@ -1232,6 +1232,8 @@
         countdownTimer: null,
         countdownValue: 60,
         isRecording: false,
+        recordingIntent: false,
+        answerSubmitted: false,
         recognitionText: '',
         timerStarted: false,
         // 讯飞语音识别相关
@@ -1408,6 +1410,7 @@
         state.currentPlayerId = msg.current_player;
         state.recognitionText = '';
         state.timerStarted  = false;
+        state.answerSubmitted = false;
 
         // 确保在比赛视图
         if (state.currentView !== 'game') {
@@ -1852,6 +1855,10 @@
             return;
         }
 
+        // 防止重复提交
+        if (state.answerSubmitted) return;
+        state.answerSubmitted = true;
+
         // 停止倒计时
         stopCountdown();
 
@@ -1926,6 +1933,11 @@
     function startRecording() {
         if ($('btn-speak').disabled) return;
         if (state.isRecording) return;
+
+        // 同步设置录音状态（解决异步竞态：getUserMedia 是异步的，用户可能在回调前松手）
+        state.isRecording = true;
+        state.recordingIntent = true;
+        state.answerSubmitted = false;
 
         // 停止当前 TTS 播放
         if (window.speechSynthesis) speechSynthesis.cancel();
@@ -2014,6 +2026,7 @@
     function _showDebugInput() {
         // 更新 UI 为录音状态
         state.isRecording = true;
+        state.recordingIntent = true;
         $('btn-speak').classList.add('recording');
         $('speak-text').innerHTML = '调试<br>模式';
 
@@ -2039,6 +2052,9 @@
 
     /** 调试模式：提交模拟输入 */
     function _debugSubmitInput() {
+        if (state.answerSubmitted) return;
+        state.answerSubmitted = true;
+
         var inp = document.getElementById('debug-mic-input');
         var text = inp ? inp.value.trim() : '';
         state.recognitionText = text;
@@ -2141,6 +2157,13 @@
     function _startAudioCapture(appId) {
         navigator.mediaDevices.getUserMedia({ audio: true })
             .then(function(stream) {
+                // 如果用户在异步初始化期间已松开按钮，中止启动
+                if (!state.recordingIntent) {
+                    stream.getTracks().forEach(function(t) { t.stop(); });
+                    console.log('[讯飞] 录音已取消，中止麦克风采音');
+                    return;
+                }
+
                 state.iflytekMediaStream = stream;
 
                 var AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -2242,8 +2265,14 @@
 
     /** 停止讯飞录音 */
     function stopRecording() {
-        if (!state.isRecording) return;
+        if (!state.isRecording && !state.recordingIntent) return;
+
         state.isRecording = false;
+        state.recordingIntent = false;
+
+        // 同步更新 UI（无论异步初始化是否完成）
+        $('btn-speak').classList.remove('recording');
+        $('speak-text').innerHTML = '按住<br>说话';
 
         // 停止倒计时
         stopCountdown();
@@ -2289,10 +2318,6 @@
             state.iflytekMediaStream = null;
         }
 
-        // 更新 UI
-        $('btn-speak').classList.remove('recording');
-        $('speak-text').innerHTML = '按住<br>说话';
-
         // 设置超时：如果 5 秒内没收到最终结果，用当前文本提交
         setTimeout(function() {
             if (state.iflytekFinalText === '') {
@@ -2304,6 +2329,10 @@
 
     /** 讯飞识别完成回调 —— 发送答案给游戏服务端 */
     function _onIflytekComplete() {
+        // 防止重复提交（超时回调 + WebSocket 回调可能都触发）
+        if (state.answerSubmitted) return;
+        state.answerSubmitted = true;
+
         _cleanupIflytek();
         var text = state.iflytekFinalText || '';
 
@@ -2383,7 +2412,7 @@
         });
 
         btn.addEventListener('mouseleave', function() {
-            if (state.isRecording) {
+            if (state.recordingIntent) {
                 stopRecording();
             }
         });
