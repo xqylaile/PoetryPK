@@ -1241,6 +1241,7 @@
         iflytekScriptProcessor: null,
         iflytekEncoder: null,
         iflytekFinalText: '',
+        iflytekAppId: '',
         iflytekIsFirstFrame: true,
         speechSupported: true,
         // 调试模式：没有麦克风时设为 true，用文字输入模拟语音识别
@@ -1488,6 +1489,12 @@
 
         // 禁用说话按钮
         $('btn-speak').disabled = true;
+
+        // 停止录音（如果正在进行）—— 必须在设置 isRecording=false 之前调用
+        if (state.isRecording) {
+            _cleanupIflytek();
+        }
+
         state.isRecording = false;
         var speakBtn = $('btn-speak');
         speakBtn.classList.remove('recording');
@@ -1496,11 +1503,6 @@
         // 禁用文字输入
         $('input-answer').disabled = true;
         $('btn-submit-text').disabled = true;
-
-        // 停止录音（如果正在进行）
-        if (state.isRecording) {
-            _cleanupIflytek();
-        }
 
         // 更新分数
         if (msg.current_scores) {
@@ -1943,11 +1945,12 @@
                 return;
             }
 
+            state.iflytekAppId = data.app_id || '';
             if (state.debugNoMic) {
                 // 调试模式：验证连接 + 弹出文字输入模拟
                 _debugTestConnection(data.url);
             } else {
-                _startIflytekRecording(data.url);
+                _startIflytekRecording(data.url, data.app_id);
             }
         });
     }
@@ -2054,7 +2057,7 @@
         sendMessage({ type: 'stop_recording', text: text });
     }
 
-    function _startIflytekRecording(wsUrl) {
+    function _startIflytekRecording(wsUrl, appId) {
         // 初始化 lamejs MP3 编码器（16kHz 单声道 32kbps）
         state.iflytekEncoder = new lamejs.Mp3Encoder(1, 16000, 32);
 
@@ -2075,7 +2078,7 @@
             clearTimeout(connectTimeout);
             wsConnected = true;
             console.log('[讯飞] WebSocket 已连接');
-            _startAudioCapture();
+            _startAudioCapture(appId);
         };
 
         ws.onmessage = function(event) {
@@ -2135,7 +2138,7 @@
     }
 
     /** 启动麦克风采音 + MP3 编码 + 流式发送 */
-    function _startAudioCapture() {
+    function _startAudioCapture(appId) {
         navigator.mediaDevices.getUserMedia({ audio: true })
             .then(function(stream) {
                 state.iflytekMediaStream = stream;
@@ -2174,6 +2177,15 @@
                     var frame;
                     if (state.iflytekIsFirstFrame) {
                         frame = {
+                            common: {
+                                app_id: appId || state.iflytekAppId
+                            },
+                            business: {
+                                domain: 'iat',
+                                language: 'zh_cn',
+                                accent: 'mandarin',
+                                vad_eos: 3000
+                            },
                             data: {
                                 status: 0,
                                 format: 'audio/L16;rate=16000',
@@ -2283,7 +2295,7 @@
 
         // 设置超时：如果 5 秒内没收到最终结果，用当前文本提交
         setTimeout(function() {
-            if (state.iflytekFinalText === '' && !state.iflytekWs) {
+            if (state.iflytekFinalText === '') {
                 state.iflytekFinalText = state.recognitionText;
                 _onIflytekComplete();
             }
