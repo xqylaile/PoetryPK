@@ -2098,6 +2098,7 @@
         };
 
         ws.onmessage = function(event) {
+            console.log('[调试] 讯飞 WS 收到消息:', event.data.substring(0, 200));
             try {
                 var resp = JSON.parse(event.data);
                 if (resp.code !== 0) {
@@ -2160,9 +2161,10 @@
                 // 如果用户在异步初始化期间已松开按钮，中止启动
                 if (!state.recordingIntent) {
                     stream.getTracks().forEach(function(t) { t.stop(); });
-                    console.log('[讯飞] 录音已取消，中止麦克风采音');
+                    console.log('[调试] 录音已取消，中止麦克风采音');
                     return;
                 }
+                console.log('[调试] getUserMedia 成功，开始设置音频管线');
 
                 state.iflytekMediaStream = stream;
 
@@ -2189,10 +2191,12 @@
                     var mp3Buf = state.iflytekEncoder.encodeBuffer(pcm);
                     if (mp3Buf.length === 0) return;
 
-                    // MP3 帧 → base64
+                    console.log('[调试] onaudioprocess: 发送音频帧, mp3大小=' + mp3Buf.length + ', isFirstFrame=' + state.iflytekIsFirstFrame);
+
+                    // MP3 帧 → base64（lamejs 返回 Int8Array，需 & 0xff 转无符号）
                     var binary = '';
                     for (var j = 0; j < mp3Buf.length; j++) {
-                        binary += String.fromCharCode(mp3Buf[j]);
+                        binary += String.fromCharCode(mp3Buf[j] & 0xff);
                     }
                     var audioBase64 = btoa(binary);
 
@@ -2265,7 +2269,11 @@
 
     /** 停止讯飞录音 */
     function stopRecording() {
-        if (!state.isRecording && !state.recordingIntent) return;
+        console.log('[调试] stopRecording 被调用, isRecording=' + state.isRecording + ', recordingIntent=' + state.recordingIntent);
+        if (!state.isRecording && !state.recordingIntent) {
+            console.log('[调试] stopRecording: 条件不满足，直接返回');
+            return;
+        }
 
         state.isRecording = false;
         state.recordingIntent = false;
@@ -2273,18 +2281,20 @@
         // 同步更新 UI（无论异步初始化是否完成）
         $('btn-speak').classList.remove('recording');
         $('speak-text').innerHTML = '按住<br>说话';
+        console.log('[调试] stopRecording: UI 已更新');
 
         // 停止倒计时
         stopCountdown();
 
         // 刷新编码器并发送最终帧
+        console.log('[调试] stopRecording: encoder=' + !!state.iflytekEncoder + ', ws=' + (state.iflytekWs ? state.iflytekWs.readyState : 'null'));
         if (state.iflytekEncoder && state.iflytekWs && state.iflytekWs.readyState === WebSocket.OPEN) {
             var mp3End = state.iflytekEncoder.flush();
             var endAudio = '';
             if (mp3End.length > 0) {
                 var binary = '';
                 for (var j = 0; j < mp3End.length; j++) {
-                    binary += String.fromCharCode(mp3End[j]);
+                    binary += String.fromCharCode(mp3End[j] & 0xff);
                 }
                 endAudio = btoa(binary);
             }
@@ -2318,19 +2328,29 @@
             state.iflytekMediaStream = null;
         }
 
-        // 设置超时：如果 5 秒内没收到最终结果，用当前文本提交
+        // 设置超时：如果 3 秒内没收到最终结果，用当前文本提交
+        console.log('[调试] stopRecording: 设置 3 秒超时, recognitionText="' + state.recognitionText + '"');
+        var resultEl = $('recognize-result');
+        resultEl.textContent = '正在识别中，请稍候...';
+        resultEl.classList.remove('empty');
+
         setTimeout(function() {
+            console.log('[调试] 超时回调触发, iflytekFinalText="' + state.iflytekFinalText + '", answerSubmitted=' + state.answerSubmitted);
             if (state.iflytekFinalText === '') {
                 state.iflytekFinalText = state.recognitionText;
                 _onIflytekComplete();
             }
-        }, 5000);
+        }, 3000);
     }
 
     /** 讯飞识别完成回调 —— 发送答案给游戏服务端 */
     function _onIflytekComplete() {
+        console.log('[调试] _onIflytekComplete 被调用, answerSubmitted=' + state.answerSubmitted + ', text="' + state.iflytekFinalText + '"');
         // 防止重复提交（超时回调 + WebSocket 回调可能都触发）
-        if (state.answerSubmitted) return;
+        if (state.answerSubmitted) {
+            console.log('[调试] _onIflytekComplete: 已提交过，跳过');
+            return;
+        }
         state.answerSubmitted = true;
 
         _cleanupIflytek();
@@ -2344,6 +2364,7 @@
         }
         resultEl.classList.remove('empty');
 
+        console.log('[调试] _onIflytekComplete: 提交答案 "' + text + '"');
         // 发送答案给游戏后端
         sendMessage({
             type: 'stop_recording',
