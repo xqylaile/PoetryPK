@@ -2596,17 +2596,21 @@
         }
 
         // 名句点评
-        if (poem.famous_lines && poem.famous_lines.length > 0) {
+        if (poem.famous_lines) {
             var linesText = '名句点评。';
-            poem.famous_lines.forEach(function(line) {
-                if (typeof line === 'string') {
-                    linesText += line + '。';
-                } else {
-                    if (line.line) linesText += line.line;
-                    if (line.comment) linesText += '，' + line.comment;
-                    linesText += '。';
-                }
-            });
+            if (Array.isArray(poem.famous_lines)) {
+                poem.famous_lines.forEach(function(line) {
+                    if (typeof line === 'string') {
+                        linesText += line + '。';
+                    } else {
+                        if (line.line) linesText += line.line;
+                        if (line.comment) linesText += '，' + line.comment;
+                        linesText += '。';
+                    }
+                });
+            } else {
+                linesText += String(poem.famous_lines) + '。';
+            }
             textParts.push(linesText);
         }
 
