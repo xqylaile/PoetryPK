@@ -915,6 +915,50 @@
             color: rgba(44, 62, 80, 0.8);
         }
 
+        /* 诗词赏析语音播报按钮 */
+        .analysis-tts-wrap {
+            display: flex;
+            justify-content: center;
+            margin-top: 18px;
+            padding-top: 16px;
+            border-top: 1px solid rgba(44, 62, 80, 0.06);
+        }
+
+        .analysis-tts-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-family: 'LXGW WenKai TC', serif;
+            font-size: 14px;
+            padding: 10px 24px;
+            border: 1.5px solid rgba(44, 62, 80, 0.2);
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.8);
+            color: var(--ink);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            letter-spacing: 1px;
+            outline: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        .analysis-tts-btn:hover {
+            background: rgba(255, 255, 255, 1);
+            border-color: var(--ink);
+        }
+
+        .analysis-tts-btn.playing {
+            background: rgba(192, 57, 43, 0.06);
+            border-color: var(--red);
+            color: var(--red);
+        }
+
+        .analysis-tts-btn .tts-icon {
+            font-size: 16px;
+            line-height: 1;
+        }
+
         /* ============ 游戏开始遮罩 ============ */
         .game-start-overlay {
             position: fixed;
@@ -1744,7 +1788,15 @@
             }
             html += '</div>';
 
+            // 语音播报按钮
+            html += '<div class="analysis-tts-wrap">';
+            html += '<button class="analysis-tts-btn" data-poem-index="' + index + '" onclick="toggleAnalysisTTS(this, ' + index + ')">';
+            html += '<span class="tts-icon">🔊</span> 语音播报</button>';
+            html += '</div>';
+
             card.innerHTML = html;
+            // 存储诗词数据用于 TTS
+            card.setAttribute('data-poem-tts', JSON.stringify(poem));
             container.appendChild(card);
             } catch(e) {
                 console.error('[诗词赏析] 渲染第' + (index+1) + '首诗词失败:', e, poem);
@@ -2468,6 +2520,141 @@
     }
 
     /* ============================================================
+     *  诗词赏析语音播报
+     * ============================================================ */
+    var analysisTtsState = {
+        playingIndex: -1  // 当前正在播报的诗词索引，-1 表示未播放
+    };
+
+    /** 切换诗词赏析的语音播报 */
+    function toggleAnalysisTTS(btn, index) {
+        if (!window.speechSynthesis) {
+            showToast('浏览器不支持语音合成');
+            return;
+        }
+
+        // 如果当前正在播放这首，停止播放
+        if (analysisTtsState.playingIndex === index) {
+            speechSynthesis.cancel();
+            resetAllTtsButtons();
+            analysisTtsState.playingIndex = -1;
+            return;
+        }
+
+        // 停止其他播放
+        speechSynthesis.cancel();
+        resetAllTtsButtons();
+
+        // 获取诗词数据
+        var container = $('poem-analysis-container');
+        var cards = container.querySelectorAll('.poem-analysis-card');
+        var card = cards[index];
+        if (!card) return;
+
+        var poemDataStr = card.getAttribute('data-poem-tts');
+        if (!poemDataStr) return;
+
+        var poem;
+        try {
+            poem = JSON.parse(poemDataStr);
+        } catch (e) {
+            console.error('[诗词TTS] 解析数据失败:', e);
+            return;
+        }
+
+        // 组合播报文本
+        var textParts = [];
+
+        // 标题和作者
+        var header = (poem.title || '无题') + '，' + (poem.author || '佚名');
+        if (poem.dynasty) header += '，' + poem.dynasty;
+        textParts.push(header);
+
+        // 全文
+        if (poem.content) {
+            textParts.push(poem.content.replace(/\n/g, '，'));
+        }
+
+        // 创作背景
+        if (poem.background) {
+            textParts.push('创作背景。' + poem.background);
+        }
+
+        // 白话译文
+        if (poem.translation) {
+            textParts.push('白话译文。' + poem.translation);
+        }
+
+        // 逐句赏析
+        if (poem.appreciation) {
+            textParts.push('逐句赏析。' + poem.appreciation);
+        }
+
+        // 艺术手法
+        if (poem.technique) {
+            textParts.push('艺术手法。' + poem.technique);
+        }
+
+        // 名句点评
+        if (poem.famous_lines && poem.famous_lines.length > 0) {
+            var linesText = '名句点评。';
+            poem.famous_lines.forEach(function(line) {
+                if (typeof line === 'string') {
+                    linesText += line + '。';
+                } else {
+                    if (line.line) linesText += line.line;
+                    if (line.comment) linesText += '，' + line.comment;
+                    linesText += '。';
+                }
+            });
+            textParts.push(linesText);
+        }
+
+        // 主题思想
+        if (poem.theme) {
+            textParts.push('主题思想。' + poem.theme);
+        }
+
+        var fullText = textParts.join('。');
+        analysisTtsState.playingIndex = index;
+
+        // 更新按钮状态
+        btn.classList.add('playing');
+        btn.innerHTML = '<span class="tts-icon">⏹</span> 停止播报';
+
+        // 创建 utterance
+        var utterance = new SpeechSynthesisUtterance(fullText);
+        utterance.lang = 'zh-CN';
+        utterance.rate = 0.85;
+        utterance.pitch = 1.0;
+
+        utterance.onend = function() {
+            console.log('[诗词TTS] 播报完成');
+            analysisTtsState.playingIndex = -1;
+            resetAllTtsButtons();
+        };
+
+        utterance.onerror = function(e) {
+            if (e.error !== 'canceled') {
+                console.error('[诗词TTS] 播报出错:', e.error);
+            }
+            analysisTtsState.playingIndex = -1;
+            resetAllTtsButtons();
+        };
+
+        speechSynthesis.speak(utterance);
+    }
+
+    /** 重置所有诗词 TTS 按钮状态 */
+    function resetAllTtsButtons() {
+        var btns = document.querySelectorAll('.analysis-tts-btn');
+        btns.forEach(function(b) {
+            b.classList.remove('playing');
+            b.innerHTML = '<span class="tts-icon">🔊</span> 语音播报';
+        });
+    }
+
+    /* ============================================================
      *  HTML 转义
      * ============================================================ */
     function escapeHtml(str) {
@@ -2546,6 +2733,8 @@
 
         // 停止 TTS
         if (window.speechSynthesis) speechSynthesis.cancel();
+        analysisTtsState.playingIndex = -1;
+        resetAllTtsButtons();
 
         // 重新连接 WebSocket
         if (state.ws) {

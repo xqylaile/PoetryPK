@@ -283,6 +283,24 @@ async def _process_answer(session, ws: WebSocket, answer_text: str):
         },
     })
 
+    # TTS 朗读答题结果
+    if result.correct:
+        tts_text = f"回答正确！下句是，{result.expected}"
+    else:
+        answer_part = ""
+        if result.answer and result.answer.strip():
+            answer_part = f"你回答的是，{result.answer}。"
+        else:
+            answer_part = "超时未作答。"
+        tts_text = f"回答错误。{answer_part}正确答案是，{result.expected}"
+
+    await send_json(ws, {
+        "type": "tts_speak",
+        "text": tts_text,
+        "rate": 0.9,
+        "pitch": 1.0,
+    })
+
     # 检查是否有人获胜
     winner_id = engine.check_winner(session)
 
@@ -314,6 +332,22 @@ async def _finish_game(session, ws: WebSocket, winner_id: str = None):
             for pp in session.players
         },
         "total_rounds": session.round_number,
+    })
+
+    # TTS 播报比赛结果
+    if winner:
+        p1 = session.players[0]
+        p2 = session.players[1]
+        s1 = session.scores.get(p1.player_id, 0)
+        s2 = session.scores.get(p2.player_id, 0)
+        tts_text = f"比赛结束！{winner.name}获胜！最终比分，{p1.name} {s1} 分，{p2.name} {s2} 分。"
+    else:
+        tts_text = "比赛结束，双方平局！"
+    await send_json(ws, {
+        "type": "tts_speak",
+        "text": tts_text,
+        "rate": 0.9,
+        "pitch": 1.0,
     })
     print("[比赛结束] game_over 消息已发送，开始生成赛后解析...")
 
